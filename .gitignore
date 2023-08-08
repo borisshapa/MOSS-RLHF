@@ -12,3 +12,6 @@ log/
 debug/
 inference/
 models/*
+.ml-job-preset.yml
+data/ppo_data/hh
+bin

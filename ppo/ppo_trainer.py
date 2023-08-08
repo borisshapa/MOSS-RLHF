@@ -1,16 +1,17 @@
-import time, math, os
-import torch
+import math
+import time
+
+import deepspeed
 import torch.nn as nn
 import torch.optim as optim
-from typing import Dict, Any, Tuple, List
-from torch.utils.data import DataLoader
-from .ppo_datahelper import *
-from utils import *
-from metric import MeanMetric, PPLMetric, SumMetric, RealtimeMetric
-from accelerate import Accelerator
-import deepspeed
+import wandb
 from deepspeed.ops.adam import DeepSpeedCPUAdam
+from torch.utils.data import DataLoader
+
+from metric import MeanMetric, PPLMetric, SumMetric, RealtimeMetric
 from metric import Metrics
+from utils import *
+from .ppo_datahelper import *
 
 
 class TrainState:
@@ -18,7 +19,7 @@ class TrainState:
         self.total_steps = 0
         self.total_exps = 0
         self.best_score = -9999999
-    
+
     def state_dict(self):
         return {
             'total_steps': self.total_steps,
@@ -31,14 +32,14 @@ class RLHFTrainableModelWrapper(nn.Module):
         super().__init__()
         self.policy_model = policy_model
         self.critic_model = critic_model
-    
+
     def forward(self, inputs, **kwargs):
         return self.policy_model(decoder_input=inputs, **kwargs), self.critic_model(decoder_input=inputs, only_last=False, **kwargs)
-    
+
     def train(self, mode=True):
         self.policy_model.train(mode)
         self.critic_model.train(mode)
-        
+
     def eval(self):
         self.policy_model.eval()
         self.critic_model.eval()
@@ -46,6 +47,12 @@ class RLHFTrainableModelWrapper(nn.Module):
 
 class PPOTrainer():
     def __init__(self, opt, policy_model, ref_model, critic_model, reward_model, accelerator, **kwargs) -> None:
+        if accelerator.is_main_process:
+            wandb.init(
+                project=os.getenv(ENV_WANDB_PROJECT),
+                entity=os.getenv(ENV_WANDB_ENTITY),
+                config=opt,
+            )
         self.opt = opt
         self.no_reset_metric_names = ['global_exs'] # metrics *NOT* be reset per save point
         self.print_interval = opt.num_rollouts // opt.batch_size
@@ -75,46 +82,46 @@ class PPOTrainer():
         self.use_ppo_pretrain_loss: bool = opt.use_ppo_pretrain_loss
 
         self.running = RunningMoments(accelerator)
-        
+
         self.model = RLHFTrainableModelWrapper(policy_model=policy_model, critic_model=critic_model)
         self.accelerator = accelerator
-        
+
         self.optimizer = self.build_optimizer()
         self.scheduler = optim.lr_scheduler.LambdaLR(
-                                optimizer=self.optimizer, 
+                                optimizer=self.optimizer,
                                 lr_lambda=self.invsqrt_scheduler(self.opt.warmup_steps)
                                 )
         self.train_metrics = self.build_metrics('train')
         self.valid_metrics = self.build_metrics('eval')
         self.tokenizer = get_tokenizer(opt)
-        
+
         self.train_state = TrainState()
         self.max_steps: int = opt.train_steps
         self.save_per_step = opt.save_per_step
         self.model_save_path = opt.model_save_path
-        
+
         self.replay_buffer = []
         self.train_loader = None
         self.prompt_loader = DataLoader(
-                                OnlyPromptDataset(self.opt, self.accelerator, mode='train'), 
-                                batch_size=None, 
-                                num_workers=self.opt.num_workers, 
-                                prefetch_factor=self.opt.num_prefetch, 
+                                OnlyPromptDataset(self.opt, self.accelerator, mode='train'),
+                                batch_size=None,
+                                num_workers=self.opt.num_workers,
+                                prefetch_factor=self.opt.num_prefetch,
                                 pin_memory=True)
         self.pretrain_loader = None
         if self.use_ppo_pretrain_loss:
             self.pretrain_loader = iter(DataLoader(
-                                    self.pretrain_dataset_class()(self.opt, self.accelerator), 
-                                    batch_size=None, 
-                                    num_workers=self.opt.num_workers, 
-                                    prefetch_factor=self.opt.num_prefetch, 
+                                    self.pretrain_dataset_class()(self.opt, self.accelerator),
+                                    batch_size=None,
+                                    num_workers=self.opt.num_workers,
+                                    prefetch_factor=self.opt.num_prefetch,
                                     pin_memory=True))
-        
+
         self.train_size = len(self.prompt_loader.dataset)
         self.prompt_loader = iter(self.prompt_loader)
-        
+
         self.model, self.optimizer, self.scheduler = self.accelerator.prepare(self.model, self.optimizer, self.scheduler)
-        
+
         # get unwrapped trainable model
         self.policy_model = self.accelerator.unwrap_model(self.model).policy_model
         self.critic_model = self.accelerator.unwrap_model(self.model).critic_model
@@ -129,7 +136,7 @@ class PPOTrainer():
         self.ppl_loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
         self.PAD_TOKEN_LABEL_ID = self.ppl_loss_fct.ignore_index
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id, reduction='none', label_smoothing=0.)
-            
+
         synchronize_if_distributed()
 
     def build_metrics(self, mode='train'):
@@ -147,7 +154,7 @@ class PPOTrainer():
         if mode == 'train':
             metrics.create_metric('reward_mean', MeanMetric())
             metrics.create_metric('reward_std', MeanMetric())
-            
+
             metrics.create_metric('approx_kl', MeanMetric())
             metrics.create_metric('ref_kl', MeanMetric())
             metrics.create_metric('values', MeanMetric())
@@ -172,7 +179,7 @@ class PPOTrainer():
             return max(step / warmup_steps, 0.1)
         def _invsqrt_lr_with_warmup(step):
             return max(_warmup_lr(step) if step < warmup_steps else _invsqrt_lr(step), 1e-8)
-        
+
         return _invsqrt_lr_with_warmup
 
     def get_parms(self, model, submodel_name, lr, eps):
@@ -220,22 +227,22 @@ class PPOTrainer():
             return PPOSFTDataset
         else:
             raise ValueError
-    
+
     def reward_model_forward(self, inputs, **kwargs):
         return self.reward_model(decoder_input=inputs, **kwargs)
-    
+
     def policy_model_forward(self, inputs, **kwargs):
         return self.policy_model(decoder_input=inputs, **kwargs)
-    
+
     def ref_model_forward(self, inputs, **kwargs):
         return self.ref_model(decoder_input=inputs, **kwargs)
-    
+
     def critic_model_forward(self, inputs, **kwargs):
         return self.critic_model(decoder_input=inputs, only_last=False, **kwargs)
-    
+
     def RLHF_model_forward(self, batch: Dict[str, Any], **kwargs):
         return self.model(batch['text_vec'], **kwargs)
-    
+
     def concat_context_and_response(self, context: List[List[int]], responses: List[List[Tuple[float, List[int]]]]):
         assert len(context) == len(responses), f'Size not match: {len(context)} and {len(responses)}'
         total_context, total_response = [], []
@@ -251,10 +258,10 @@ class PPOTrainer():
 
                 # Debug
                 # logging.info(f'===={self.tokenizer.decode(_context + resp, skip_special_tokens=False)}')
-                
+
         total_gene_samples_vec = [c + r for c, r in zip(total_context, total_response)]
         return total_context, total_response, total_gene_samples_vec # total_context, total_response, total_gene_samples_vec
-    
+
     def save_checkpoint(self, is_best: bool, total_steps: int):
         best_model_path = os.path.join(self.model_save_path, 'best_model')
         steps_model_path = os.path.join(self.model_save_path, 'Steps_{}'.format(total_steps))
@@ -278,9 +285,9 @@ class PPOTrainer():
             state_dict=state_dict,
         )
         logging.info(f'Saved model of {total_steps} steps to {steps_model_path}.')
-        
+
         synchronize_if_distributed()
-        
+
     @torch.no_grad()
     def make_experiences(self):
         start_time = time.time()
@@ -291,20 +298,20 @@ class PPOTrainer():
             batch: Dict[str, Any] = next(self.prompt_loader)
             to_cuda(batch)
             context_vec = batch['text_vec'].tolist()
-            
+
             # sample from env
             _, responses_vec = self.policy_model.generate(batch)
             assert len(context_vec) == len(responses_vec)
-            
+
             context_vec_sampled, resp_vec_sampled, sampled_vec = self.concat_context_and_response(context_vec, responses_vec)
-            sampled_vec = torch.tensor(pad_sequences(sampled_vec, pad_value=self.tokenizer.pad_token_id, padding='left'), 
+            sampled_vec = torch.tensor(pad_sequences(sampled_vec, pad_value=self.tokenizer.pad_token_id, padding='left'),
                                        dtype=torch.long, device=self.accelerator.device)
             bsz = sampled_vec.size(0)
-            
+
             rewards, *_ = self.reward_model_forward(sampled_vec)
             rewards = rewards.cpu()
             self.train_metrics.record_metric_many('rewards', rewards.tolist())
-            
+
             if self.use_reward_scaling:
                 # Reward scaling
                 rewards_mean, rewards_std = self.running.update(rewards)
@@ -315,22 +322,22 @@ class PPOTrainer():
                 logging.info(f"Running mean: {self.running.mean}, std: {self.running.std}")
                 self.train_metrics.record_metric('reward_mean', rewards_mean)
                 self.train_metrics.record_metric('reward_std', rewards_std)
-                
+
             if self.use_reward_clip:
                 # Reward clip
                 rewards = torch.clip(rewards, -self.reward_clip, self.reward_clip)
-                
+
             # Precompute logprobs, values
             ref_logits, *_ = self.ref_model_forward(sampled_vec)
             logits, *_ = self.policy_model_forward(sampled_vec)
             values, *_ = self.critic_model_forward(sampled_vec)
             torch.cuda.empty_cache()
             assert ref_logits.size(1) == logits.size(1) == values.size(1), f'{ref_logits.size()}, {logits.size()}, {values.size()}'
-            
+
             ref_logprobs = logprobs_from_logits(ref_logits[:, :-1, :], sampled_vec[:, 1:])
             logprobs = logprobs_from_logits(logits[:, :-1, :], sampled_vec[:, 1:])
             values = values[:, :-1]
-            
+
             kl_penalty = (-self.kl_penalty_weight * (logprobs - ref_logprobs)).cpu()
 
             # compute train ppl
@@ -338,7 +345,7 @@ class PPOTrainer():
             label[label == self.tokenizer.pad_token_id] = self.PAD_TOKEN_LABEL_ID
             shift_label = label[:, 1:].contiguous()
             valid_length = (shift_label != self.PAD_TOKEN_LABEL_ID).sum(dim=-1)
-            
+
             # compute ppl
             shift_logits = logits[..., :-1, :].contiguous()
             ppl_value = self.ppl_loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_label.view(-1))
@@ -352,17 +359,17 @@ class PPOTrainer():
             ppl0_value = ppl0_value.view(len(ref_logits), -1)
             ppl0_value = torch.sum(ppl0_value, -1) / valid_length
             ppl0_value = ppl0_value.cpu().tolist()
-            
+
             logging.info(f'ppl_value: {ppl_value}')
             logging.info(f'ppl0_value: {ppl0_value}')
-            
+
             # gather samples
             for i in range(bsz):
                 resp_length = len(resp_vec_sampled[i])
                 penalized_rewards = kl_penalty[i].clone()
                 penalized_rewards[-1] += rewards[i]
                 self.train_metrics.record_metric('ref_kl', (logprobs[i][-resp_length:] - ref_logprobs[i][-resp_length:]).mean().item())
-                
+
                 sample = {
                     'context_vec': context_vec_sampled[i],
                     'context': self.tokenizer.decode(context_vec_sampled[i], skip_special_tokens=False),
@@ -384,16 +391,16 @@ class PPOTrainer():
                     sample['ppo_loss_mask'] = ppo_batch['loss_mask'].tolist()
 
                 self.replay_buffer.append(sample)
-                
+
         logging.info(f'Sampled {len(self.replay_buffer)} samples in {(time.time() - start_time):.2f} seconds')
         self.model.train()
-        
+
     def criterion(self, model_output: Tuple[torch.Tensor, ...], batch: Dict[str, Any], return_output=False, training=True):
         policy_output, critic_output = model_output
         policy_logits, *_ = policy_output
         values, *_ = critic_output
         values = values[:, :-1]
-        
+
         loss_mask = batch['loss_mask']
         loss_mask = loss_mask[:, 1:]
         old_values = batch['values']
@@ -408,9 +415,9 @@ class PPOTrainer():
             advantages = torch.clamp(advantages, -self.advantage_clip, self.advantage_clip)
         n = loss_mask.sum()
 
-        
+
         logprobs = logprobs_from_logits(policy_logits[:, :-1, :], batch['text_vec'][:, 1:]) * loss_mask
-        
+
         # vf loss
         values_clipped = torch.clamp(
             values,
@@ -427,12 +434,12 @@ class PPOTrainer():
             vf_loss = 0.5 * torch.sum(vf_loss1 * loss_mask) / n
 
         vf_clipfrac = torch.sum((vf_loss2 > vf_loss1).float() * loss_mask) / n
-        
+
         log_ratio = (logprobs - old_logprobs) * loss_mask
         ratio = torch.exp(log_ratio)
         with torch.no_grad():
             approx_kl = torch.sum((ratio - 1) - log_ratio) / n
-            
+
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * torch.clamp(
             ratio,
@@ -452,7 +459,7 @@ class PPOTrainer():
             entro_loss = torch.abs(torch.sum(ent * loss_mask) / n - self.entropy_clip)
 
         # cal pretrain loss
-        if self.use_ppo_pretrain_loss: 
+        if self.use_ppo_pretrain_loss:
             pretrain_sampled_vec = batch['ppo_context_vec']
 
             scores, *_ = self.policy_model_forward(pretrain_sampled_vec)
@@ -464,15 +471,15 @@ class PPOTrainer():
             ppo_label_vec[~ppo_loss_mask] = self.tokenizer.pad_token_id
 
             labels: torch.LongTensor = ppo_label_vec
-            
+
             score_view = scores.reshape(-1, scores.size(-1)) # bs * num_tokens, vocab_size
             pretrain_loss = self.loss_fn(score_view, labels.reshape(-1)).sum()
-            
+
             # calculate token acc
             notnull = labels.ne(self.tokenizer.pad_token_id)
             target_tokens = notnull.sum()
             correct = ((labels == preds) * notnull).sum()
-            
+
             # average losses
             pretrain_loss = pretrain_loss / target_tokens
 
@@ -487,7 +494,7 @@ class PPOTrainer():
                 loss = pg_loss + self.vf_loss_weight * vf_loss + self.entropy_loss_weight * entro_loss
             else:
                 loss = pg_loss + self.vf_loss_weight * vf_loss
-        
+
         with torch.no_grad():
             if training:
                 obj_metrics = self.train_metrics
@@ -523,7 +530,7 @@ class PPOTrainer():
             return loss, model_output
 
         return loss
-    
+
     def train_step(self, batch: Dict[str, Any], **kwargs):
         self.optimizer.zero_grad()
         # forward
@@ -553,21 +560,21 @@ class PPOTrainer():
         start_time = time.time()
 
         valid_dataloader = DataLoader(
-            OnlyPromptDataset(self.opt, self.accelerator, mode=datatype), 
-            batch_size=None, 
-            num_workers=self.opt.num_workers, 
-            prefetch_factor=self.opt.num_prefetch, 
+            OnlyPromptDataset(self.opt, self.accelerator, mode=datatype),
+            batch_size=None,
+            num_workers=self.opt.num_workers,
+            prefetch_factor=self.opt.num_prefetch,
             pin_memory=True)
-        
+
         print_rank_0(f'Start evaluation on {datatype} data.')
         self.model.eval()
-        
+
         for step, batch in enumerate(valid_dataloader):
             to_cuda(batch)
             _, responses = self.policy_model.generate(batch, **kwargs)
             _, _, output_vec = self.concat_context_and_response(batch['text_vec'].tolist(), responses)
 
-            output_vec = torch.tensor(pad_sequences(output_vec, pad_value=self.tokenizer.pad_token_id, padding='left'), 
+            output_vec = torch.tensor(pad_sequences(output_vec, pad_value=self.tokenizer.pad_token_id, padding='left'),
                                                      dtype=torch.long, device=self.accelerator.device)
             rewards = self.reward_model_forward(output_vec)[0].tolist()
             assert len(rewards) == output_vec.size(0), f"{rewards.size()}, {output_vec.size()}"
@@ -596,15 +603,16 @@ class PPOTrainer():
 
             self.valid_metrics.record_metric_many('ppl', ppl_value.cpu().tolist())
             self.valid_metrics.record_metric_many('ppl_policy0', ppl0_value.cpu().tolist())
-            
+
         # log info
         metrics = self.valid_metrics.all_gather_metrics()
         self.valid_metrics.display(self.train_state.total_steps, gathered_metrics=metrics)
         self.valid_metrics.write_tensorboard(self.train_state.total_steps, gathered_metrics=metrics)
+        self.valid_metrics.write_wandb(self.train_state.total_steps, gathered_metrics=metrics)
         self.valid_metrics.flush()
         validation_score = metrics['rewards']
         self.valid_metrics.reset(no_reset=[])
-        
+
         print_rank_0(f'Evaluation completed in {(time.time() - start_time):.2f} seconds.')
         self.model.train()
         torch.cuda.empty_cache()
@@ -617,20 +625,20 @@ class PPOTrainer():
         synchronize_if_distributed()
         print_rank_0('Start training.')
         self.model.train()
-        
+
         while self.train_state.total_steps < self.max_steps:
             self.make_experiences()
             self.train_loader = DataLoader(
-                ExperienceDataset(self.replay_buffer, self.opt, self.accelerator), 
-                batch_size=None, 
-                num_workers=self.opt.num_workers, 
-                prefetch_factor=self.opt.num_prefetch, 
+                ExperienceDataset(self.replay_buffer, self.opt, self.accelerator),
+                batch_size=None,
+                num_workers=self.opt.num_workers,
+                prefetch_factor=self.opt.num_prefetch,
                 pin_memory=True)
 
             for batch in self.train_loader:
                 if self.train_state.total_steps >= self.max_steps:
                     break
-                
+
                 start_time = time.time()
 
                 with torch.no_grad():
@@ -643,7 +651,7 @@ class PPOTrainer():
                 # perform a step of train
                 self.train_step(batch)
                 del batch
-                
+
                 # record
                 cost_time = time.time() - start_time
                 self.train_metrics.record_metric('ups', 1. / cost_time)
@@ -653,20 +661,21 @@ class PPOTrainer():
                     lr = self.optimizer.param_groups[0]['lr']
                 self.train_metrics.record_metric('lr', lr)
                 self.train_state.total_steps += 1
-                
+
                 # print metrics
                 need_reset = False
                 if self.train_state.total_steps % self.print_interval == 0:
                     metrics = self.train_metrics.all_gather_metrics()
                     self.train_metrics.write_tensorboard(self.train_state.total_steps, gathered_metrics=metrics)
+                    self.train_metrics.write_wandb(self.train_state.total_steps, gathered_metrics=metrics)
                     self.train_metrics.display(self.train_state.total_steps, self.train_size, gathered_metrics=metrics)
                     need_reset = True
-                    
+
                 # do evaluation for every save_per_step steps
                 if self.train_state.total_steps % self.save_per_step == 0:
                     eval_score, _ = self.evaluate()
                     self.model.train()
-                        
+
                     # save checkpoint
                     is_best = eval_score > self.train_state.best_score
                     if is_best:
@@ -674,9 +683,9 @@ class PPOTrainer():
                         print_rank_0(f'Greater than the best score {abs(eval_score)}.')
                     else:
                         print_rank_0(f'Did not beat the best score {abs(self.train_state.best_score)}.')
-                        
+
                     self.save_checkpoint(is_best=is_best, total_steps=self.train_state.total_steps)
-        
+
                 if need_reset:
                     self.train_metrics.reset(no_reset=self.no_reset_metric_names)
 

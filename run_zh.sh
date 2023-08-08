@@ -5,7 +5,7 @@
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 \
 accelerate launch \
     --config_file accelerate_config.yaml \
-train_ppo.py \
+scripts/train_ppo.py \
     --tokenizer_name_or_path models/moss-rlhf-reward-model-7B-zh \
     --policy_model_path models/sft_model \
     --critic_model_path models/moss-rlhf-reward-model-7B-zh/recover \

@@ -7,6 +7,9 @@ from typing import Tuple
 
 accelerator = None
 
+ENV_WANDB_PROJECT = "WANDB_PROJECT"
+ENV_WANDB_ENTITY = "WANDB_ENTITY"
+
 def setup_accelerator():
     global accelerator
     if accelerator is None:

@@ -15,33 +15,56 @@
 from typing import Optional
 
 import fire
+import loguru
 import torch
 import tqdm
 import transformers
-from train_ppo import LlamaRewardModel
+from scripts.train_ppo import LlamaRewardModel, Llama
 
 
 @torch.inference_mode()
 def make_diff(
-    path_raw: str, path_tuned: str, path_diff: str, device="cpu",  # "cuda" or "cpu"
+    path_raw: str,
+    path_tuned: str,
+    path_diff: str,
+    model_type: str = None,
+    device="cpu",  # "cuda" or "cpu"
 ):
     """Make the weight diff.
 
     This function is given to present full transparency of how the weight diff was created.
 
     Run:
-        python weight_diff.py make_diff --path_raw decapoda-research/llama-7b-hf --path_tuned <your_path_tuned> --path_diff <your_path_diff>
+        python weight_diff.py make_diff --path_raw decapoda-research/llama-7b-hf --path_tuned <your_path_tuned> --path_diff <your_path_diff> --model_type
     """
-    model_tuned = LlamaRewardModel.from_pretrained(
-        path_tuned,
-        opt=None,
-        tokenizer=None,
-        device_map={"": torch.device(device)},
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-    )
-    # zh: decapoda-research/llama-7b-hf
-    # en: 
+    if model_type == "reward":
+        model_tuned = LlamaRewardModel.from_pretrained(
+            path_tuned,
+            opt=None,
+            tokenizer=None,
+            device_map={"": torch.device(device)},
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+    elif model_type == "sft":
+        model_tuned = Llama.from_pretrained(
+            path_tuned,
+            opt=None,
+            tokenizer=None,
+            device_map={"": torch.device(device)},
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+    elif model_type == "policy":
+        model_tuned = Llama.from_pretrained(
+            path_tuned,
+            opt=None,
+            tokenizer=None,
+            device_map={"": torch.device(device)},
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+
     model_raw = transformers.AutoModelForCausalLM.from_pretrained(
         path_raw,
         device_map={"": torch.device(device)},
@@ -55,11 +78,14 @@ def make_diff(
     for key in tqdm.tqdm(state_dict_tuned):
         print(key)
 
-    check_allsum = sum(state_dict_tuned[key].sum() for key in state_dict_tuned) # 49954.0859375
-    print(f'check sum is {check_allsum}')
+    # en-reward-model 50810.703125
+    # en-sft-model 50874.84765625
+    # en-policy-model
+    check_allsum = sum(state_dict_tuned[key].sum() for key in state_dict_tuned)
+    print(f"check sum is {check_allsum}")
 
     for key in tqdm.tqdm(state_dict_tuned):
-        if 'layers' in key:
+        if "layers" in key:
             state_dict_tuned[key].add_(-state_dict_raw[key])
 
     model_tuned.save_pretrained(path_diff)
@@ -71,6 +97,7 @@ def recover(
     path_diff,
     path_tuned: Optional[str] = None,
     device="cpu",
+    model_type=None,
     check_integrity_naively=True,
 ):
     """Recover the original weights from the released weight diff.
@@ -90,20 +117,49 @@ def recover(
         - If you want to save the recovered weights, set `--path_tuned <your_path_tuned>`.
             Next time you can load the recovered weights directly from `<your_path_tuned>`.
     """
-    model_raw = transformers.AutoModelForCausalLM.from_pretrained(
-        path_raw,
-        device_map={"": torch.device(device)},
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-    )
-    model_recovered = LlamaRewardModel.from_pretrained(
-        path_diff,
-        opt=None,
-        tokenizer=None,
-        device_map={"": torch.device(device)},
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-    )
+    while True:
+        try:
+            model_raw = transformers.AutoModelForCausalLM.from_pretrained(
+                path_raw,
+                device_map={"": torch.device(device)},
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True,
+            )
+
+            if model_type == "reward":
+                model_recovered = LlamaRewardModel.from_pretrained(
+                    path_diff,
+                    opt=None,
+                    tokenizer=None,
+                    device_map={"": torch.device(device)},
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True,
+                )
+                fill_value = 50810.703125
+            elif model_type == "sft":
+                model_recovered = Llama.from_pretrained(
+                    path_diff,
+                    opt=None,
+                    tokenizer=None,
+                    device_map={"": torch.device(device)},
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True,
+                )
+                fill_value = 50874.84765625
+            elif model_type == "policy":
+                model_recovered = Llama.from_pretrained(
+                    path_diff,
+                    opt=None,
+                    tokenizer=None,
+                    device_map={"": torch.device(device)},
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True,
+                )
+                fill_value = 0
+            break
+        except Exception as e:
+            loguru.logger.info(str(e))
+            continue
 
     state_dict_recovered = model_recovered.state_dict()
     state_dict_raw = model_raw.state_dict()
@@ -112,19 +168,19 @@ def recover(
         print(key)
 
     for key in tqdm.tqdm(state_dict_recovered):
-        if 'layers' in key:
+        if "layers" in key:
             state_dict_recovered[key].add_(state_dict_raw[key])
 
     if check_integrity_naively:
         # This is not a rigorous, cryptographically strong integrity check :)
         allsum = sum(state_dict_recovered[key].sum() for key in state_dict_recovered)
         assert torch.allclose(
-            allsum, torch.full_like(allsum, fill_value=49954.0859375), rtol=1e-5, atol=1e-8
+            allsum, torch.full_like(allsum, fill_value=fill_value), rtol=1e-5, atol=1e-8
         ), "Naive integrity check failed. This could imply that some of the checkpoint files are corrupted."
-        print('Check successfully.')
+        print("Check successfully.")
 
     if path_tuned is not None:
-        model_recovered.save_pretrained(path_tuned)
+        model_recovered.save_pretrained(path_tuned, max_shard_size="10GB")
 
     return model_recovered
 
